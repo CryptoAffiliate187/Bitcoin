@@ -7,13 +7,22 @@
 from decimal import Decimal
 
 from test_framework.blocktools import COINBASE_MATURITY
-from test_framework.messages import COIN
+from test_framework.messages import (
+    COIN,
+    tx_from_hex,
+    WITNESS_SCALE_FACTOR,
+)
 from test_framework.p2p import P2PTxInvStore
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,
     assert_raises_rpc_error,
     chain_transaction,
+)
+from test_framework.wallet import (
+    bulk_transaction,
+    create_child_with_parents,
+    make_chain,
 )
 
 # default limits
@@ -47,6 +56,8 @@ class MempoolPackagesTest(BitcoinTestFramework):
         peer_inv_store = self.nodes[0].add_p2p_connection(P2PTxInvStore()) # keep track of invs
         self.generate(self.nodes[0], COINBASE_MATURITY + 1)
         utxo = self.nodes[0].listunspent(10)
+        self.privkeys = [self.nodes[0].get_deterministic_priv_key().key]
+        self.address = self.nodes[0].get_deterministic_priv_key().address
         txid = utxo[0]['txid']
         vout = utxo[0]['vout']
         value = utxo[0]['amount']
@@ -211,13 +222,65 @@ class MempoolPackagesTest(BitcoinTestFramework):
         assert set(mempool1).issubset(set(mempool0))
         for tx in chain[:MAX_ANCESTORS_CUSTOM]:
             assert tx in mempool1
-        # TODO: more detailed check of node1's mempool (fees etc.)
+        mempool1_verbose = self.nodes[1].getrawmempool(True)
+        assert_equal(len(mempool1_verbose), MAX_ANCESTORS_CUSTOM)
+        ancestor_subset = chain[:MAX_ANCESTORS_CUSTOM]
+        ancestor_vsize = sum([mempool1_verbose[tx]['vsize'] for tx in ancestor_subset])
+        ancestor_fees = sum([mempool1_verbose[tx]['fees']['base'] for tx in ancestor_subset])
+        ancestor_count = MAX_ANCESTORS_CUSTOM
+        descendant_count = 1
+        descendant_fees = Decimal(0)
+        descendant_vsize = 0
+        descendants = []
+        ancestors = list(ancestor_subset)
+        for x in reversed(ancestor_subset):
+            entry = self.nodes[1].getmempoolentry(x)
+            assert_equal(entry, mempool1_verbose[x])
+            assert_equal(entry['descendantcount'], descendant_count)
+            descendant_fees += entry['fees']['base']
+            assert_equal(entry['fees']['descendant'], descendant_fees)
+            descendant_vsize += entry['vsize']
+            assert_equal(entry['descendantsize'], descendant_vsize)
+            descendant_count += 1
+
+            assert_equal(entry['ancestorcount'], ancestor_count)
+            assert_equal(entry['fees']['ancestor'], ancestor_fees)
+            assert_equal(entry['ancestorsize'], ancestor_vsize)
+            ancestor_vsize -= entry['vsize']
+            ancestor_fees -= entry['fees']['base']
+            ancestor_count -= 1
+
+            assert_equal(entry['spentby'], descendants[-1:])
+            assert_equal(entry['depends'], ancestors[-2:-1])
+            descendants.append(x)
+            ancestors.remove(x)
         # check transaction unbroadcast info (should be false if in both mempools)
         mempool = self.nodes[0].getrawmempool(True)
         for tx in mempool:
             assert_equal(mempool[tx]['unbroadcast'], False)
 
-        # TODO: test ancestor size limits
+        self.log.info("Check ancestor size limits")
+        target_weight = WITNESS_SCALE_FACTOR * 1000 * 40
+        high_fee = Decimal("0.004")
+        utxos_large = self.nodes[0].listunspent()[2:4]
+        parents_tx = []
+        values = []
+        scripts = []
+        for u in utxos_large[:2]:
+            txid = u["txid"]
+            value = u["amount"]
+            (tx, _, _, _) = make_chain(self.nodes[0], self.address, self.privkeys, txid, value, u["vout"], None, high_fee)
+            tx = bulk_transaction(tx, self.nodes[0], target_weight, self.privkeys)
+            self.nodes[0].sendrawtransaction(tx.serialize().hex())
+            parents_tx.append(tx)
+            values.append(Decimal(tx.vout[0].nValue) / COIN)
+            scripts.append(tx.vout[0].scriptPubKey.hex())
+
+        child_hex = create_child_with_parents(self.nodes[0], self.address, self.privkeys, parents_tx, values, scripts, high_fee)
+        child_tx = bulk_transaction(tx_from_hex(child_hex), self.nodes[0], target_weight, self.privkeys)
+        assert_raises_rpc_error(-26, "exceeds ancestor size limit", self.nodes[0].sendrawtransaction, child_tx.serialize().hex())
+        self.generate(self.nodes[0], 1)
+        self.sync_blocks()
 
         # Now test descendant chain limits
         txid = utxo[1]['txid']
@@ -268,9 +331,48 @@ class MempoolPackagesTest(BitcoinTestFramework):
             assert tx in mempool1
         for tx in chain[MAX_DESCENDANTS_CUSTOM:]:
             assert tx not in mempool1
-        # TODO: more detailed check of node1's mempool (fees etc.)
+        mempool1_verbose = self.nodes[1].getrawmempool(True)
+        for tx in mempool1:
+            entry = self.nodes[1].getmempoolentry(tx)
+            assert_equal(entry, mempool1_verbose[tx])
+            ancestors = self.nodes[1].getmempoolancestors(tx, True)
+            descendants = self.nodes[1].getmempooldescendants(tx, True)
+            assert_equal(entry['ancestorcount'], len(ancestors) + 1)
+            assert_equal(entry['descendantcount'], len(descendants) + 1)
+            assert_equal(entry['ancestorsize'], entry['vsize'] + sum(a['vsize'] for a in ancestors.values()))
+            assert_equal(entry['fees']['ancestor'], entry['fees']['base'] + sum(a['fees']['base'] for a in ancestors.values()))
+            assert_equal(entry['descendantsize'], entry['vsize'] + sum(d['vsize'] for d in descendants.values()))
+            assert_equal(entry['fees']['descendant'], entry['fees']['base'] + sum(d['fees']['base'] for d in descendants.values()))
 
-        # TODO: test descendant size limits
+        self.log.info("Check descendant size limits")
+        target_weight = WITNESS_SCALE_FACTOR * 1000 * 40
+        high_fee = Decimal("0.004")
+        utxo_large = self.nodes[0].listunspent()[4]
+        (parent_tx, _, val, spk) = make_chain(self.nodes[0], self.address, self.privkeys, utxo_large['txid'], utxo_large['amount'], utxo_large['vout'], None, high_fee)
+        parent_tx = bulk_transaction(parent_tx, self.nodes[0], target_weight, self.privkeys)
+        self.nodes[0].sendrawtransaction(parent_tx.serialize().hex())
+
+        prevtxs = [{
+            'txid': parent_tx.rehash(),
+            'vout': 0,
+            'scriptPubKey': spk,
+            'amount': val,
+        }]
+        (child_small, _, val_child, spk_child) = make_chain(self.nodes[0], self.address, self.privkeys, parent_tx.rehash(), val, 0, spk, high_fee)
+        child_tx = bulk_transaction(child_small, self.nodes[0], target_weight, self.privkeys, prevtxs)
+        self.nodes[0].sendrawtransaction(child_tx.serialize().hex())
+
+        prevtxs2 = [{
+            'txid': child_tx.rehash(),
+            'vout': 0,
+            'scriptPubKey': spk_child,
+            'amount': val_child,
+        }]
+        (grand_small, _, _, _) = make_chain(self.nodes[0], self.address, self.privkeys, child_tx.rehash(), val_child, 0, spk_child, high_fee)
+        grand_tx = bulk_transaction(grand_small, self.nodes[0], target_weight, self.privkeys, prevtxs2)
+        assert_raises_rpc_error(-26, "exceeds descendant size limit", self.nodes[0].sendrawtransaction, grand_tx.serialize().hex())
+        self.generate(self.nodes[0], 1)
+        self.sync_blocks()
 
         # Test reorg handling
         # First, the basics:
